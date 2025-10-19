@@ -4,7 +4,7 @@ import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import Button from "@/components/Button";
 import { useRouter } from "next/navigation";
-import { useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 const Schema = z.object({
   name: z.string().min(2),
@@ -15,32 +15,52 @@ const Schema = z.object({
 
 type Input = z.infer<typeof Schema>;
 
-export default function OnboardingPage() {
+export default function UserProfilePage() {
   const router = useRouter();
-  const [files, setFiles] = useState<string[]>([]);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const [loaded, setLoaded] = useState(false);
+  const {
+    register,
+    handleSubmit,
+    setValue,
+    formState: { errors },
+  } = useForm<Input>({ resolver: zodResolver(Schema) });
 
-  const { register, handleSubmit, formState: { errors } } = useForm<Input>({
-    resolver: zodResolver(Schema),
-    defaultValues: { name: "", email: "", phone: "", zip: "" },
-  });
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem("customer");
+      if (raw) {
+        const c = JSON.parse(raw);
+        setValue("name", c.name ?? "");
+        setValue("email", c.email ?? "");
+        setValue("phone", c.phone ?? "");
+        setValue("zip", c.zip ?? "");
+      }
+    } catch {}
+    setLoaded(true);
+  }, [setValue]);
 
   const onSubmit = (data: Input) => {
-    sessionStorage.setItem("customer", JSON.stringify({ ...data, documents: files }));
-    router.push("/customer/recommendations");
+    try {
+      const existing = JSON.parse(sessionStorage.getItem("customer") ?? "{}");
+      const next = { ...existing, ...data };
+      sessionStorage.setItem("customer", JSON.stringify(next));
+    } catch {}
+    router.push("/user/documents");
   };
+
+  if (!loaded) return null;
 
   return (
     <div className="min-h-screen bg-gray-50 py-10">
       <div className="max-w-3xl mx-auto px-4">
         <div className="mb-6">
-          <h1 className="text-3xl font-bold">Get Started</h1>
-          <p className="text-sm text-gray-600">Tell us about yourself to personalize recommendations</p>
+          <h1 className="text-3xl font-bold">Your Profile</h1>
+          <p className="text-sm text-gray-600">Update your personal information</p>
         </div>
 
         <div className="bg-white border rounded-xl shadow-sm">
           <div className="px-6 py-5 border-b">
-            <h2 className="text-lg font-semibold">Customer Onboarding</h2>
+            <h2 className="text-lg font-semibold">Personal Information</h2>
           </div>
 
           <form onSubmit={handleSubmit(onSubmit)} className="px-6 py-5 space-y-6">
@@ -59,35 +79,7 @@ export default function OnboardingPage() {
               </label>
             </div>
 
-            {Object.values(errors).length > 0 && (
-              <p className="text-sm text-red-600">Please fix errors above.</p>
-            )}
-
-            <div className="space-y-3">
-              <p className="text-sm font-medium">Upload Documents</p>
-              <div className="rounded-lg border-2 border-dashed p-4 bg-gray-50">
-                <input
-                  ref={fileRef}
-                  type="file"
-                  multiple
-                  onChange={(e) => {
-                    const names = Array.from(e.target.files ?? []).map((f) => f.name);
-                    setFiles((prev) => [...prev, ...names]);
-                  }}
-                />
-                {files.length > 0 && (
-                  <ul className="flex flex-wrap gap-2 mt-3">
-                    {files.map((f) => (
-                      <li key={f} className="text-xs px-2 py-1 rounded bg-gray-200">{f}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            </div>
-
-            <Button type="submit" className="w-full py-3 text-white bg-blue-600 hover:bg-blue-700">
-              Continue to Recommendations
-            </Button>
+            <Button type="submit" className="w-full">Save Changes</Button>
           </form>
         </div>
       </div>
