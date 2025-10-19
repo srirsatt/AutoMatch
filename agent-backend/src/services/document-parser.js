@@ -14,6 +14,27 @@ const DOC_PROCESSORS = {
     identity: process.env.LICENSE_PROCESSOR_ID,
 };
 
+const VERTEX_API_KEY = process.env.VERTEX_API_KEY;
+const VERTEX_LOCATION = process.env.VERTEX_LOCATION;
+const VERTEX_MATCH_AGENT = process.env.VERTEX_MATCH_AGENT;
+
+function requireEnv(value, key) {
+    if (!value) throw new Error(`Missing env: ${key}`);
+    return value;
+}
+
+const MIME_TYPES = {
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+}
+
+
+function guessMimeType(filePath) {
+  return MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/pdf';
+}
+
 const IMPORTANT_FIELDS = {
   w2: {
     employeeName: 'employee_name',
@@ -35,24 +56,6 @@ const IMPORTANT_FIELDS = {
   },
 };
 
-const MIME_TYPES = {
-    '.pdf': 'application/pdf',
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-}
-
-function requireEnv(value, key) {
-    if (!value) {
-        throw new Error(`Missing env var: ${key}`);
-    }
-    return value;
-}
-
-function guessMimeType(filePath) {
-    const extension = path.extname(filePath).toLowerCase();
-    return MIME_TYPES[extension] || 'application/pdf';
-}
 
 async function downloadFromSupabase(filePath) {
     requireEnv(SUPABASE_BUCKET, 'SUPABASE_CUSTOMER_DOCS_BUCKET');
@@ -94,6 +97,35 @@ async function processWithDocAi(docType, gcsUri, mimeType) {
     return result.document;
 }
 
+function buildParagraphExtractor(document) {
+  const fullText = document.text || '';
+
+  function sliceFromTextAnchor(anchor) {
+    if (!anchor) return null;
+    if (anchor.content) return anchor.content.trim();
+
+    const segments = anchor.textSegments || [];
+    return segments
+        .map(({ startIndex = 0, endIndex }) => {
+            const end = endIndex ?? fullText.length;
+            return fullText.substring(startIndex, end);
+        })
+        .join('')
+        .trim();
+  }
+
+  return () => {
+    const out = [];
+    for (const pg of (document.pages || [])) {
+      for (const par of (pg.paragraphs || [])) {
+        const text = sliceFromTextAnchor(par.layout?.textAnchor);
+        if (text) out.push(text);
+      }
+  }
+  return out;
+    };
+}
+
 function getEntityValue(entity) {
     return (
         entity.normalizedValue?.text ??
@@ -123,22 +155,6 @@ function indexEntities(document) {
     return map;
 }
 
-function extractImportantFields(document, docType) {
-    const fields = {};
-    const wantedTypes = IMPORTANT_FIELDS[docType] || {};
-    for (const [fieldKey, entityType] of Object.entries(wantedTypes)) {
-        const entity = document.entities?.find((entry) => entry.type === entityType) || null;
-
-        if (!entity) continue;
-
-        fields[fieldKey] = {
-            value: getEntityValue(entity),
-            confidence: entity.confidence ?? null,
-        };
-    }
-    return fields;
-}
-
 async function processCustomerDocument({ customerId, docType, filePath }) {
     requireEnv(PROJECT_ID, 'GOOGLE_CLOUD_PROJECT_ID');
     requireEnv(LOCATION, 'DOCUMENT_AI_LOCATION');
@@ -154,19 +170,138 @@ async function processCustomerDocument({ customerId, docType, filePath }) {
 
     const parsedDocument = await processWithDocAi(docType, gcsUri, mimeType);
 
+    const paragraphs = buildParagraphExtractor(parsedDocument)();
+    const entities = indexEntities(parsedDocument);
+
+    // store it (document_ingestions.parsed_fields)
     return {
-        customerId, 
+        customerId,
         docType,
         supabasePath: filePath,
         gcsUri,
-        parsedAt: new Date().toISOString(),
-        processorId: DOC_PROCESSORS[docType],
-        importantFields: extractImportantFields(parsedDocument, docType),
-        entities: indexEntities(parsedDocument),
-        paragraphs: parsedDocument?.text ? parsedDocument.text.split('\n') : [],
+        paragraphs,
+        entities,
+        rawDocument: parsedDocument
     };
 }
 
+async function runMatchAgent(payload) {
+    requireEnv(VERTEX_API_KEY, 'VERTEX_API_KEY');
+    requireEnv(VERTEX_LOCATION, 'VERTEX_LOCATION');
+    requireEnv(VERTEX_MATCH_AGENT, 'VERTEX_MATCH_AGENT');
+
+    const url = `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/${VERTEX_MATCH_AGENT}:generateContent`;
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': VERTEX_API_KEY,
+        },
+        body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: JSON.stringify(payload) }] }],
+            generationConfig: {
+                temperature: 0.3,
+                responseMimeType: 'application/json',
+            },
+        }),
+    });
+
+    if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`Vertex request failed: ${res.status} ${body}`);
+    }
+
+    const data = await res.json();
+    const answer = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}';
+    return JSON.parse(answer);
+}
+
+async function buildVertexPayload(customerId) {
+    const [{ data: docRows, error: docError }, { data: cars, error: carError }] = 
+        await Promise.all([
+            supabaseAdmin
+                .from('customer_documents')
+                .select('doc_type, file_path')
+                .eq('customer_id', customerId),
+            supabaseAdmin
+                .from('cars')
+                .select('id, make, model, year, msrp, apr, monthly_rate, time'),
+        ]);
+
+    if (docError) throw new Error(`${docError.message}`);
+    if (carError) throw new Error(`${carError.message}`);
+
+    const parsedDocs = await Promise.all(
+        (docRows || []).map((row) => 
+            processCustomerDocument({
+                customerId,
+                docType: row.doc_type,
+                filePath: row.file_path,
+            })
+        )
+    );
+
+    const docMap = parsedDocs.reduce((acc, doc) => {
+        acc[doc.docType] = doc;
+        return acc;
+    }, {});
+
+    return {
+        customerId,
+        documents: {
+            w2: docMap.w2?.paragraphs ?? [],
+            identity: docMap.identity?.paragraphs ?? [],
+        },
+        entities: {
+            w2: docMap.w2?.entities ?? {},
+            identity: docMap.identity?.entities ?? {},
+        },
+        carCatalog: (cars || []).map((car) => ({
+            id: car.id,
+            make: car.make,
+            model: car.model,
+            year: car.year,
+            msrp: Number(car.msrp),
+            apr: car.apr,
+            monthly_rate: car.monthly_rate,
+            time: car.time,
+            label: `${car.make} ${car.model}`,
+        })),
+        instructions: [
+            'Role: automotive finance assistant.',
+            'Use W-2 and license info to estimate affordability.',
+            'Return JSON: { "recommendations": [ { "carId": number, "score": number, "rationale": string } ] }',
+            'If data is missing, note it in rationale but still rank by affordability.',
+        ].join('\n'),
+    };
+}
+
+async function runVertexMatch(customerId, { persist = true } = {}) {
+  const payload = await buildVertexPayload(customerId);
+  const result = await runMatchAgent(payload);
+
+  const recommendations = result?.recommendations ?? [];
+  if (!persist || recommendations.length === 0) return recommendations;
+
+  const upsertRows = recommendations.map((rec) => ({
+    customer_id: customerId,
+    car_id: rec.carId,
+    score: rec.score,
+    name: rec.label,
+    rationale: rec.rationale,
+  }));
+
+  await supabaseAdmin
+    .from('customer_matches')
+    .upsert(upsertRows, { onConflict: 'customer_id,car_id' });
+
+  return recommendations;
+}
+
+/* ---------- Public exports ---------- */
 module.exports = {
-    processCustomerDocument,
+  processCustomerDocument,
+  buildVertexPayload,
+  runVertexMatch,
 };
