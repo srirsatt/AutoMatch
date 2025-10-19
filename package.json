@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@google-cloud/documentai": "^9.5.0",
+    "@google-cloud/storage": "^7.17.2",
+    "@supabase/supabase-js": "^2.75.1",
+    "dotenv": "^17.2.3"
+  }
+}
