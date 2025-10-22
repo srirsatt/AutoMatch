@@ -1,4 +1,4 @@
-# Car Platform
+# AutoMatch
 
 A Next.js + Supabase application that simulates a car financing marketplace with two portals:
 
@@ -160,3 +160,4 @@ Adjust the schema to your needs; set RLS and foreign keys appropriately for prod
 ## Contributing
 
 Pull requests welcome. Keep changes focused and consistent with the existing style. Configure RLS and migrations before shipping any production changes.
+
